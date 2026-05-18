@@ -1,0 +1,114 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════
+#  docker-compose.yml  —  EC2 Backend (Innovatech Chile)
+#  Levanta: back-Ventas (8080), back-Despachos (8081) y MySQL (3306)
+#
+#  Uso:
+#    docker compose up -d          # levantar en background
+#    docker compose down           # detener y eliminar contenedores
+#    docker compose logs -f        # ver logs en tiempo real
+# ══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ──────────────────────────────────────
+  # Base de datos MySQL compartida
+  # Los dos backends se conectan a esta
+  # misma instancia, en databases distintas
+  # ──────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: mysql_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      # MySQL 8 crea automáticamente las bases de datos al arrancar
+      # si se pasan como init scripts. Las dos apps usan
+      # createDatabaseIfNotExist=true en su JDBC URL, por lo que
+      # basta con proveer el usuario root con los permisos correctos.
+    ports:
+      # Puerto expuesto solo hacia la red interna del compose.
+      # No se mapea a 0.0.0.0 del host para no exponer la BD
+      # directamente a internet (seguridad).
+      - "127.0.0.1:3306:3306"
+    volumes:
+      # Named volume: los datos sobreviven reinicios y recreaciones
+      # de contenedor. Justificación: named volume vs bind mount:
+      # elegimos named volume porque Docker gestiona la ubicación,
+      # evitando dependencias de paths del host y facilitando
+      # backups con `docker volume`.
+      - mysql_data:/var/lib/mysql
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ──────────────────────────────────────
+  # Backend Ventas — Spring Boot (8080)
+  # ──────────────────────────────────────
+  back-ventas:
+    image: ${DOCKERHUB_USERNAME}/back-ventas:latest
+    container_name: back_ventas
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_ENDPOINT: mysql        # nombre del servicio = hostname dentro de la red
+      DB_PORT: 3306
+      DB_NAME: ventas_db
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    ports:
+      - "8080:8080"
+    networks:
+      - backend_net
+    # Sin volumen de datos propio: la app es stateless.
+    # El estado persiste en MySQL (mysql_data).
+
+  # ──────────────────────────────────────
+  # Backend Despachos — Spring Boot (8081)
+  # ──────────────────────────────────────
+  back-despachos:
+    image: ${DOCKERHUB_USERNAME}/back-despachos:latest
+    container_name: back_despachos
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_ENDPOINT: mysql
+      DB_PORT: 3306
+      DB_NAME: despachos_db
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    ports:
+      - "8081:8081"
+    networks:
+      - backend_net
+
+# ──────────────────────────────────────
+# Named Volume para persistencia de MySQL
+# ──────────────────────────────────────
+volumes:
+  mysql_data:
+    driver: local
+    # Named volume (no bind mount):
+    # - bind mount requeriría que el path exista en el host
+    # - named volume es portable y gestionado por Docker
+    # - permite backup: docker run --rm -v mysql_data:/data ...
+
+# ──────────────────────────────────────
+# Red interna: los servicios se comunican
+# por nombre (DNS interno de Docker).
+# Solo los puertos explicitamente publicados
+# son accesibles desde fuera.
+# ──────────────────────────────────────
+networks:
+  backend_net:
+    driver: bridge
