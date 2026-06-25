@@ -1,96 +1,51 @@
-name: CI/CD — Back Ventas
+name: CI/CD — Back Ventas (EKS)
 
-# ─────────────────────────────────────────────────────────────────
-# Trigger: se activa únicamente cuando se hace push a la rama deploy
-# ─────────────────────────────────────────────────────────────────
 on:
   push:
     branches:
       - deploy
 
 env:
-  IMAGE_NAME: back-ventas
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
 
 jobs:
-
-  # ──────────────────────────────────────────────
-  # JOB 1: Build & Push imagen a Docker Hub
-  # ──────────────────────────────────────────────
-  build-and-push:
-    name: Build & Push Docker Image
+  build-and-deploy:
+    name: Build, Push to ECR and Deploy to EKS
     runs-on: ubuntu-latest
-
     steps:
-      # 1. Checkout del código fuente
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Login en Docker Hub usando secrets almacenados en GitHub
-      #    Nunca se escriben credenciales en el código.
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # 3. Configurar Docker Buildx para builds multi-plataforma
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # 4. Build y Push de la imagen con dos tags:
-      #    - :latest   → siempre apunta a la versión más reciente
-      #    - :sha-XXXX → tag inmutable ligado al commit (trazabilidad)
-      - name: Build and Push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-          # Cache de capas para builds más rápidos
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build, tag and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-  # ──────────────────────────────────────────────
-  # JOB 2: Deploy en EC2 (SSH)
-  # Solo corre si el build fue exitoso
-  # ──────────────────────────────────────────────
-  deploy:
-    name: Deploy to EC2
-    runs-on: ubuntu-latest
-    needs: build-and-push
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region ${{ env.AWS_REGION }}
 
-    steps:
-      # Conexión SSH a la instancia EC2 backend.
-      # La clave privada y la IP están en GitHub Secrets.
-      - name: Deploy via SSH to EC2
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_BACKEND_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          # Secuencia de comandos en el EC2:
-          # 1. Login en Docker Hub (para pull de imagen privada)
-          # 2. Pull de la nueva imagen
-          # 3. Restart del stack con docker compose
-          script: |
-            echo "=== Iniciando deploy back-ventas ==="
-
-            # Login en Docker Hub desde el EC2
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
-              docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
-            # Mover al directorio del proyecto
-            cd ~/app
-
-            # Actualizar la imagen
-            docker compose pull back-ventas
-
-            # Reiniciar solo el servicio de ventas (sin afectar MySQL ni despachos)
-            docker compose up -d --no-deps back-ventas
-
-            # Limpiar imágenes antiguas para liberar espacio en disco
-            docker image prune -f
-
-            echo "=== Deploy back-ventas completado ==="
+      - name: Deploy new image to EKS
+        run: |
+          kubectl set image deployment/back-ventas back-ventas=${{ steps.build-image.outputs.image }} -n innovatech
+          kubectl rollout status deployment/back-ventas -n innovatech --timeout=120s
